@@ -76,8 +76,8 @@ jobs:
             local output="$2"
             local result source_type file_id
             local share_api_url download_url
-            local content_type http_code
-            local tmp="${output}.part"
+            local content_type http_code tmp
+            tmp="${output}.part"
 
             if [[ -z "${url:-}" ]]; then
               echo "::error::Required download URL is empty."
@@ -157,76 +157,93 @@ jobs:
               gdown "$file_id" -O "$output"
             else
               rm -f "$tmp"
+              content_type="unknown"
+              http_code="000"
 
-              # Attempt 1: Follow the OneDrive sharing link.
-              if content_type="$(
+              # Attempt 1: OneDrive sharing URL.
+              if result="$(
                 curl --silent --show-error --location \
-                  --retry 3 --connect-timeout 30 \
+                  --retry 2 --connect-timeout 30 \
                   --user-agent "Mozilla/5.0" \
                   --output "$tmp" \
-                  --write-out '%{content_type}' \
+                  --write-out '%{http_code}|%{content_type}' \
                   "$download_url"
               )"; then
-                http_code="200"
-              else
-                http_code="000"
+                IFS='|' read -r http_code content_type <<< "$result"
               fi
 
-              # Reject HTML pages and empty responses.
-              if [[ "$http_code" == "200" ]] \
-                && [[ -s "$tmp" ]] \
-                && [[ "$content_type" != text/html* ]] \
-                && ! python - "$tmp" <<'PY'
+              valid_file() {
+                [[ -s "$1" ]] || return 1
+                python - "$1" <<'PY'
           import sys
           from pathlib import Path
+
           p = Path(sys.argv[1])
-          head = p.read_bytes()[:4096].lstrip().lower()
-          is_html = head.startswith(
-              (b"<!doctype html", b"<html", b"<head")
-          )
-          raise SystemExit(0 if is_html else 1)
+          data = p.read_bytes()[:4096].lstrip().lower()
+
+          if data.startswith((b"<!doctype html", b"<html", b"<head")):
+              raise SystemExit(1)
+
+          if data.startswith((b"{", b"[")):
+              raise SystemExit(1)
+
+          raise SystemExit(0)
           PY
-              then
+              }
+
+              if [[ "$http_code" == "200" ]] && valid_file "$tmp"; then
                 mv "$tmp" "$output"
               else
-                # Attempt 2: Legacy OneDrive content endpoint.
+                echo "Direct download failed: HTTP $http_code"
                 rm -f "$tmp"
-                echo "Direct download failed; trying fallback endpoint."
 
-                if content_type="$(
+                # Attempt 2: legacy OneDrive endpoint.
+                content_type="unknown"
+                http_code="000"
+
+                if result="$(
                   curl --silent --show-error --location \
                     --retry 2 --connect-timeout 30 \
                     --user-agent "Mozilla/5.0" \
                     --output "$tmp" \
-                    --write-out '%{content_type}' \
+                    --write-out '%{http_code}|%{content_type}' \
                     "$share_api_url"
                 )"; then
-                  http_code="200"
-                else
-                  http_code="000"
+                  IFS='|' read -r http_code content_type <<< "$result"
                 fi
 
-                if [[ "$http_code" == "200" ]] \
-                  && [[ -s "$tmp" ]] \
-                  && [[ "$content_type" != text/html* ]] \
-                  && ! python - "$tmp" <<'PY'
-          import sys
-          from pathlib import Path
-          p = Path(sys.argv[1])
-          head = p.read_bytes()[:4096].lstrip().lower()
-          is_html = head.startswith(
-              (b"<!doctype html", b"<html", b"<head")
-          )
-          raise SystemExit(0 if is_html else 1)
-          PY
-                then
+                if [[ "$http_code" == "200" ]] && valid_file "$tmp"; then
                   mv "$tmp" "$output"
                 else
+                  echo "::error::OneDrive returned an error response."
+                  echo "HTTP status: $http_code"
+                  echo "Content-Type: $content_type"
+
+                  if [[ -s "$tmp" ]]; then
+                    python - "$tmp" <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          try:
+              obj = json.loads(
+                  Path(sys.argv[1]).read_text(errors="replace")
+              )
+              if isinstance(obj, dict):
+                  err = obj.get("error", obj)
+                  if isinstance(err, dict):
+                      print("Error code:", err.get("code", "unknown"))
+                      print("Error message:", err.get("message", "unknown"))
+                  else:
+                      print("JSON error response received.")
+              else:
+                  print("JSON response received, not a file.")
+          except Exception:
+              print("Response was not valid JSON.")
+          PY
+                  fi
+
                   rm -f "$tmp"
-                  echo "::error::OneDrive download failed."
-                  echo "::error::Direct Content-Type: ${content_type:-unknown}"
-                  echo "::error::HTTP status: ${http_code:-unknown}"
-                  echo "::error::Verify anonymous access and file sharing URL."
                   return 1
                 fi
               fi
@@ -274,7 +291,10 @@ jobs:
           work = Path(sys.argv[1])
           game_dir = Path(sys.argv[2])
           extensions = {".nsp", ".xci", ".nsz", ".xcz"}
-          rar_signatures = (b"Rar!\x1a\x07\x00", b"Rar!\x1a\x07\x01\x00")
+          rar_signatures = (
+              b"Rar!\x1a\x07\x00",
+              b"Rar!\x1a\x07\x01\x00",
+          )
 
           def validate(path):
               with path.open("rb") as f:
@@ -306,7 +326,7 @@ jobs:
                   extract_dir.mkdir(parents=True, exist_ok=True)
                   subprocess.run(
                       ["unar", "-o", str(extract_dir), str(source)],
-                      check=True
+                      check=True,
                   )
                   packages = sorted(
                       p for p in extract_dir.rglob("*")
@@ -323,7 +343,8 @@ jobs:
                       ext = ".xci"
                   else:
                       raise SystemExit(
-                          f"{label} is not a recognized RAR, NSP or XCI."
+                          f"{label} is not a recognized RAR, NSP or XCI. "
+                          f"Signature: {signature[:16].hex()}"
                       )
                   target = game_dir / f"{label}{ext}"
                   shutil.copy2(source, target)
