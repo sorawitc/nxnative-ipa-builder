@@ -415,7 +415,7 @@ jobs:
           echo "DM_GAME=$PROFILE_ID" >> "$GITHUB_ENV"
           echo "DETECTED_TITLE_ID=$DETECTED_ID" >> "$GITHUB_ENV"
 
-      - name: Update shader toolchain lock and header
+      - name: Generate shader toolchain header
         shell: bash
         run: |
           set -euo pipefail
@@ -430,7 +430,6 @@ jobs:
             exit 1
           fi
 
-          python "$CHAIN_SCRIPT" --update-lock
           python "$CHAIN_SCRIPT" --header
 
       - name: Build unsigned IPA
