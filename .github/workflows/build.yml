@@ -5,7 +5,7 @@ on:
   workflow_dispatch:
     inputs:
       device:
-        description: "Choose target device"
+        description: "Choose the target device and texture support path"
         required: true
         type: choice
         default: "iPhone 15 or older (BC fallback)"
@@ -13,7 +13,7 @@ on:
           - "iPhone 15 or older (BC fallback)"
           - "iPhone 15 Pro/Pro Max or newer (standard)"
       profile_id:
-        description: "Optional nxnative profile ID"
+        description: "Optional nxnative profile ID override (leave blank for automatic detection)"
         required: false
         type: string
         default: ""
@@ -34,7 +34,7 @@ jobs:
           repository: mianmuhammadse/nxnative
           ref: d158df611bf2f3fa315c4f16585575cdfdb2a1d3
 
-      - name: Checkout standard version
+      - name: Checkout standard nxnative version
         if: inputs.device == 'iPhone 15 Pro/Pro Max or newer (standard)'
         uses: actions/checkout@v4
         with:
@@ -57,7 +57,8 @@ jobs:
           set -euo pipefail
           brew install xcodegen zstd spirv-cross unar
           python -m pip install --upgrade pip
-          python -m pip install lz4 capstone fonttools backports.zstd gdown
+          python -m pip install \
+            lz4 capstone fonttools backports.zstd gdown
 
       - name: Download game files and keys
         env:
@@ -71,17 +72,55 @@ jobs:
           WORK="$RUNNER_TEMP/nxnative"
           mkdir -p "$WORK"
 
+          download_candidate() {
+            local url="$1"
+            local output="$2"
+            local response
+            local content_type
+
+            EFFECTIVE_URL=""
+            if ! response="$(
+              curl --silent --show-error --fail --location \
+                --retry 3 --connect-timeout 30 \
+                --output "$output" \
+                --write-out '%{content_type}\n%{url_effective}' \
+                "$url"
+            )"; then
+              return 1
+            fi
+
+            content_type="${response%%$'\n'*}"
+            EFFECTIVE_URL="${response#*$'\n'}"
+            [[ "$content_type" != text/html* ]] \
+              && ! python - "$output" <<'PY'
+          import sys
+          from pathlib import Path
+
+          prefix = Path(sys.argv[1]).read_bytes()[:2048].lstrip().lower()
+          raise SystemExit(
+              0 if prefix.startswith((b"<!doctype html", b"<html", b"<head"))
+              else 1
+          )
+          PY
+          }
+
           download_file() {
             local url="$1"
             local output="$2"
-            local result source_type file_id
-            local share_api_url download_url
-            local content_type http_code tmp
-            tmp="${output}.part"
+            local source_type
+            local file_id
+            local share_api_url
+            local resolved_share_api_url
+            local api_candidate
+            local last_api_candidate
+            local downloaded
+            local download_url
+            local result
+            local temporary_output="${output}.part"
 
             if [[ -z "${url:-}" ]]; then
-              echo "::error::Required download URL is empty."
-              return 1
+              echo "::error::A required download URL is empty."
+              exit 1
             fi
 
             result="$(python - "$url" <<'PY'
@@ -89,29 +128,38 @@ jobs:
           import re
           import sys
           from urllib.parse import (
-              parse_qsl, parse_qs, urlencode, urlparse, urlunparse
+              parse_qsl,
+              parse_qs,
+              urlencode,
+              urlparse,
+              urlunparse,
           )
 
           url = sys.argv[1].strip()
           parsed = urlparse(url)
-          host = (parsed.hostname or "").lower()
           query = parse_qs(parsed.query)
           file_id = None
 
-          if host in ("drive.google.com", "www.drive.google.com"):
+          if parsed.netloc.lower() in (
+              "drive.google.com",
+              "www.drive.google.com",
+          ):
               match = re.search(r"/file/d/([^/]+)", parsed.path)
               if match:
                   file_id = match.group(1)
               elif query.get("id"):
                   file_id = query["id"][0]
 
-          if not file_id and re.fullmatch(r"[-A-Za-z0-9_]{20,}", url):
+          if not file_id and re.fullmatch(
+              r"[-A-Za-z0-9_]{20,}", url
+          ):
               file_id = url
 
           if file_id:
               print(f"google|{file_id}||")
               raise SystemExit(0)
 
+          host = (parsed.hostname or "").lower()
           is_onedrive = (
               host in ("1drv.ms", "onedrive.live.com")
               or host.endswith(".sharepoint.com")
@@ -120,138 +168,120 @@ jobs:
 
           if parsed.scheme != "https" or not is_onedrive:
               raise SystemExit(
-                  "Unsupported link. Use a Google Drive file ID "
-                  "or HTTPS OneDrive sharing URL."
+                  "Unsupported download link. Use a Google Drive file ID "
+                  "or an HTTPS OneDrive sharing link."
               )
 
-          encoded = base64.urlsafe_b64encode(
-              url.encode("utf-8")
-          ).decode("ascii").rstrip("=")
-
+          share_id = "u!" + base64.urlsafe_b64encode(
+              url.encode()
+          ).decode().rstrip("=")
           api_url = (
-              "https://api.onedrive.com/v1.0/shares/u!"
-              + encoded
+              "https://api.onedrive.com/v1.0/shares/"
+              + share_id
               + "/root/content"
           )
-
-          pairs = [
-              (k, v) for k, v in
-              parse_qsl(parsed.query, keep_blank_values=True)
-              if k.lower() != "download"
+          download_query = [
+              (key, value)
+              for key, value in parse_qsl(
+                  parsed.query, keep_blank_values=True
+              )
+              if key.lower() != "download"
           ]
-          pairs.append(("download", "1"))
-          direct_url = urlunparse(
-              parsed._replace(query=urlencode(pairs))
+          download_query.append(("download", "1"))
+          download_url = urlunparse(
+              parsed._replace(query=urlencode(download_query))
           )
-
-          print(f"onedrive||{api_url}|{direct_url}")
+          print(f"onedrive||{api_url}|{download_url}")
           PY
           )"
 
+            echo "Downloading $(basename "$output")..."
             IFS='|' read -r \
               source_type file_id share_api_url download_url <<< "$result"
-
-            echo "Downloading $(basename "$output")..."
 
             if [[ "$source_type" == "google" ]]; then
               gdown "$file_id" -O "$output"
             else
-              rm -f "$tmp"
-              content_type="unknown"
-              http_code="000"
-
-              # Attempt 1: OneDrive sharing URL.
-              if result="$(
-                curl --silent --show-error --location \
-                  --retry 2 --connect-timeout 30 \
-                  --user-agent "Mozilla/5.0" \
-                  --output "$tmp" \
-                  --write-out '%{http_code}|%{content_type}' \
-                  "$download_url"
-              )"; then
-                IFS='|' read -r http_code content_type <<< "$result"
-              fi
-
-              valid_file() {
-                [[ -s "$1" ]] || return 1
-                python - "$1" <<'PY'
+              if download_candidate "$download_url" "$temporary_output"; then
+                mv "$temporary_output" "$output"
+              elif [[ "$source_type" == "onedrive" ]]; then
+                rm -f "$temporary_output"
+                resolved_share_api_url="$(
+                  python - "$EFFECTIVE_URL" "$share_api_url" <<'PY'
+          import base64
           import sys
-          from pathlib import Path
+          from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
-          p = Path(sys.argv[1])
-          data = p.read_bytes()[:4096].lstrip().lower()
+          url, fallback = sys.argv[1:]
+          parsed = urlparse(url)
+          host = (parsed.hostname or "").lower()
+          is_onedrive = (
+              host in ("1drv.ms", "onedrive.live.com")
+              or host.endswith(".sharepoint.com")
+              or host.endswith(".onedrive.com")
+          )
 
-          if data.startswith((b"<!doctype html", b"<html", b"<head")):
-              raise SystemExit(1)
+          if parsed.scheme != "https" or not is_onedrive:
+              print(fallback)
+              raise SystemExit(0)
 
-          if data.startswith((b"{", b"[")):
-              raise SystemExit(1)
-
-          raise SystemExit(0)
-          PY
-              }
-
-              if [[ "$http_code" == "200" ]] && valid_file "$tmp"; then
-                mv "$tmp" "$output"
-              else
-                echo "Direct download failed: HTTP $http_code"
-                rm -f "$tmp"
-
-                # Attempt 2: legacy OneDrive endpoint.
-                content_type="unknown"
-                http_code="000"
-
-                if result="$(
-                  curl --silent --show-error --location \
-                    --retry 2 --connect-timeout 30 \
-                    --user-agent "Mozilla/5.0" \
-                    --output "$tmp" \
-                    --write-out '%{http_code}|%{content_type}' \
-                    "$share_api_url"
-                )"; then
-                  IFS='|' read -r http_code content_type <<< "$result"
-                fi
-
-                if [[ "$http_code" == "200" ]] && valid_file "$tmp"; then
-                  mv "$tmp" "$output"
-                else
-                  echo "::error::OneDrive returned an error response."
-                  echo "HTTP status: $http_code"
-                  echo "Content-Type: $content_type"
-
-                  if [[ -s "$tmp" ]]; then
-                    python - "$tmp" <<'PY'
-          import json
-          import sys
-          from pathlib import Path
-
-          try:
-              obj = json.loads(
-                  Path(sys.argv[1]).read_text(errors="replace")
+          query = [
+              (key, value)
+              for key, value in parse_qsl(
+                  parsed.query, keep_blank_values=True
               )
-              if isinstance(obj, dict):
-                  err = obj.get("error", obj)
-                  if isinstance(err, dict):
-                      print("Error code:", err.get("code", "unknown"))
-                      print("Error message:", err.get("message", "unknown"))
-                  else:
-                      print("JSON error response received.")
-              else:
-                  print("JSON response received, not a file.")
-          except Exception:
-              print("Response was not valid JSON.")
+              if key.lower() != "download"
+          ]
+          canonical_url = urlunparse(
+              parsed._replace(query=urlencode(query))
+          )
+          share_id = "u!" + base64.urlsafe_b64encode(
+              canonical_url.encode()
+          ).decode().rstrip("=")
+          print(
+              "https://api.onedrive.com/v1.0/shares/"
+              + share_id
+              + "/root/content"
+          )
           PY
+                )"
+                downloaded="false"
+                last_api_candidate=""
+                for api_candidate in \
+                  "$resolved_share_api_url" "$share_api_url"; do
+                  if [[ "$downloaded" == "true" ]] \
+                    || [[ "$api_candidate" == "$last_api_candidate" ]]; then
+                    continue
+                  fi
+                  last_api_candidate="$api_candidate"
+
+                  if [[ -s "$temporary_output" ]]; then
+                    rm -f "$temporary_output"
                   fi
 
-                  rm -f "$tmp"
-                  return 1
+                  if download_candidate \
+                    "$api_candidate" "$temporary_output"; then
+                    mv "$temporary_output" "$output"
+                    downloaded="true"
+                    break
+                  fi
+                done
+
+                if [[ "$downloaded" != "true" ]]; then
+                  rm -f "$temporary_output"
+                  echo "::error::OneDrive did not return a file. Set sharing to 'Anyone with the link' and use a direct file sharing link."
+                  exit 1
                 fi
+              else
+                rm -f "$temporary_output"
+                echo "::error::The URL did not return a downloadable file."
+                exit 1
               fi
             fi
 
             if [[ ! -s "$output" ]]; then
               echo "::error::Downloaded file is empty."
-              return 1
+              exit 1
             fi
 
             file "$output"
@@ -263,18 +293,18 @@ jobs:
           if [[ -n "${UPDATE_URL:-}" ]]; then
             download_file "$UPDATE_URL" "$WORK/update.download"
           else
-            echo "No update configured."
+            echo "No UPDATE_URL configured; continuing without an update."
           fi
 
           if [[ -n "${DLC_URL:-}" ]]; then
             download_file "$DLC_URL" "$WORK/dlc.download"
           else
-            echo "No DLC configured."
+            echo "No DLC_URL configured; continuing without DLC."
           fi
 
           chmod 600 "$WORK/prod.keys"
 
-      - name: Extract archives and prepare game packages
+      - name: Extract RAR archives or accept direct game packages
         shell: bash
         run: |
           set -euo pipefail
@@ -290,79 +320,145 @@ jobs:
 
           work = Path(sys.argv[1])
           game_dir = Path(sys.argv[2])
-          extensions = {".nsp", ".xci", ".nsz", ".xcz"}
+          package_extensions = {
+              ".nsp", ".xci", ".nsz", ".xcz"
+          }
           rar_signatures = (
               b"Rar!\x1a\x07\x00",
               b"Rar!\x1a\x07\x01\x00",
           )
 
-          def validate(path):
+          def validate_package(path):
               with path.open("rb") as f:
                   magic = f.read(4)
+
               suffix = path.suffix.lower()
+
               if suffix in (".nsp", ".nsz") and magic != b"PFS0":
-                  raise SystemExit(f"Invalid NSP/NSZ signature: {path.name}")
+                  raise SystemExit(
+                      f"Invalid {suffix} package signature: {path.name}"
+                  )
+
               if suffix in (".xci", ".xcz") and magic != b"HEAD":
-                  raise SystemExit(f"Invalid XCI/XCZ signature: {path.name}")
+                  raise SystemExit(
+                      f"Invalid {suffix} package signature: {path.name}"
+                  )
 
           def add_package(source, label):
               target = game_dir / source.name
-              if target.exists():
-                  raise SystemExit(f"Duplicate package: {source.name}")
-              validate(source)
-              shutil.copy2(source, target)
-              print(f"Added {label}: {target.name}")
 
-          for label in ("game", "update", "dlc"):
+              if target.exists():
+                  raise SystemExit(
+                      "Duplicate package filename: " + source.name
+                  )
+
+              validate_package(source)
+              shutil.copy2(source, target)
+
+              print(
+                  f"Added {label}: {target.name} "
+                  f"({target.stat().st_size:,} bytes)"
+              )
+
+          def process_download(label):
               source = work / f"{label}.download"
+
               if not source.exists():
-                  continue
+                  print(f"No {label} download; skipping.")
+                  return
 
               with source.open("rb") as f:
                   signature = f.read(8)
 
-              if any(signature.startswith(s) for s in rar_signatures):
+              is_rar = any(
+                  signature.startswith(magic)
+                  for magic in rar_signatures
+              )
+
+              if is_rar:
                   extract_dir = work / f"extracted-{label}"
                   extract_dir.mkdir(parents=True, exist_ok=True)
+
+                  print(f"{label}: RAR archive detected; extracting.")
+
                   subprocess.run(
-                      ["unar", "-o", str(extract_dir), str(source)],
+                      [
+                          "unar",
+                          "-o",
+                          str(extract_dir),
+                          str(source),
+                      ],
                       check=True,
                   )
+
                   packages = sorted(
                       p for p in extract_dir.rglob("*")
-                      if p.is_file() and p.suffix.lower() in extensions
+                      if p.is_file()
+                      and p.suffix.lower() in package_extensions
                   )
+
                   if not packages:
-                      raise SystemExit(f"No game packages in {label} archive.")
+                      raise SystemExit(
+                          f"No NSP/XCI/NSZ/XCZ packages found "
+                          f"in the {label} RAR archive."
+                      )
+
                   for package in packages:
                       add_package(package, label)
+
               else:
+                  print(
+                      f"{label}: not a RAR archive; "
+                      "checking as a direct package."
+                  )
+
                   if signature[:4] == b"PFS0":
-                      ext = ".nsp"
+                      extension = ".nsp"
                   elif signature[:4] == b"HEAD":
-                      ext = ".xci"
+                      extension = ".xci"
                   else:
                       raise SystemExit(
-                          f"{label} is not a recognized RAR, NSP or XCI. "
-                          f"Signature: {signature[:16].hex()}"
+                          f"{label} is not a recognized RAR archive "
+                          "or direct NSP/XCI package. "
+                          "Direct downloads must be NSP or XCI files."
                       )
-                  target = game_dir / f"{label}{ext}"
-                  shutil.copy2(source, target)
-                  validate(target)
-                  print(f"Added direct package: {target.name}")
 
-          packages = [
+                  target = game_dir / f"{label}{extension}"
+
+                  if target.exists():
+                      raise SystemExit(
+                          f"Output package already exists: {target.name}"
+                      )
+
+                  shutil.copy2(source, target)
+                  validate_package(target)
+
+                  print(
+                      f"Added direct package: {target.name} "
+                      f"({target.stat().st_size:,} bytes)"
+                  )
+
+          process_download("game")
+          process_download("update")
+          process_download("dlc")
+
+          packages = sorted(
               p for p in game_dir.iterdir()
-              if p.is_file() and p.suffix.lower() in extensions
-          ]
+              if p.is_file()
+              and p.suffix.lower() in package_extensions
+          )
+
           if not packages:
               raise SystemExit("No game packages were prepared.")
-          if not (work / "prod.keys").is_file():
-              raise SystemExit("prod.keys is missing.")
-          print("Prepared packages:", len(packages))
+
+          print("\n=== Prepared game packages ===")
+          for package in packages:
+              print(f"{package.name}: {package.stat().st_size:,} bytes")
           PY
 
-      - name: Detect title ID and select profile
+          test -s "$WORK/prod.keys"
+
+      - name: Detect game title ID and select shader profile
         env:
           PROFILE_OVERRIDE: ${{ inputs.profile_id }}
         shell: bash
@@ -383,53 +479,85 @@ jobs:
               try:
                   with path.open("rb") as f:
                       header = f.read(16)
+
                       if len(header) != 16 or header[:4] != b"PFS0":
                           return []
-                      count, string_size = struct.unpack_from("<II", header, 4)
+
+                      count, string_size = struct.unpack_from(
+                          "<II", header, 4
+                      )
+
                       if count > 100000 or string_size > 100000000:
                           return []
+
                       entries = f.read(count * 0x18)
                       strings = f.read(string_size)
+
                       if len(entries) != count * 0x18:
                           return []
+
                       names = []
+
                       for i in range(count):
                           offset = struct.unpack_from(
                               "<I", entries, i * 0x18 + 0x10
                           )[0]
+
                           if offset >= len(strings):
                               continue
+
                           end = strings.find(b"\0", offset)
-                          if end >= 0:
-                              names.append(
-                                  strings[offset:end].decode(errors="replace")
+
+                          if end < 0:
+                              continue
+
+                          names.append(
+                              strings[offset:end].decode(
+                                  errors="replace"
                               )
+                          )
+
                       return names
+
               except (OSError, struct.error):
                   return []
 
           candidates = set()
+
           for path in root.iterdir():
               if not path.is_file() or path.suffix.lower() not in extensions:
                   continue
+
               for name in pfs0_names(path):
                   match = re.fullmatch(
-                      r"([0-9A-Fa-f]{16})[0-9A-Fa-f]{16}\.tik", name
+                      r"([0-9A-Fa-f]{16})[0-9A-Fa-f]{16}\.tik",
+                      name,
                   )
+
                   if match:
                       title_id = int(match.group(1), 16)
+
                       if (title_id & 0xFFF) == 0:
                           candidates.add(f"{title_id:016X}")
-              match = re.search(r"\[([0-9A-Fa-f]{16})\]", path.name)
+
+              match = re.search(
+                  r"\[([0-9A-Fa-f]{16})\]",
+                  path.name,
+              )
+
               if match:
                   title_id = int(match.group(1), 16)
+
                   if (title_id & 0xFFF) == 0:
                       candidates.add(f"{title_id:016X}")
 
           if len(candidates) != 1:
               raise SystemExit(
-                  f"Cannot uniquely identify base title ID: {sorted(candidates)}"
+                  "Could not uniquely identify the base game's title ID. "
+                  f"Candidates found: {sorted(candidates)}. "
+                  "Check the base NSP and its ticket/filename."
               )
+
           print(next(iter(candidates)))
           PY
           )"
@@ -438,24 +566,30 @@ jobs:
           PROFILE_ID="$(echo "$PROFILE_ID" | tr '[:lower:]' '[:upper:]')"
 
           if [[ ! "$PROFILE_ID" =~ ^[0-9A-F]{16}$ ]]; then
-            echo "::error::Profile ID must be 16 hexadecimal characters."
+            echo "::error::Profile ID must be exactly 16 hexadecimal characters."
             exit 1
           fi
 
+          echo "Detected base title ID: $DETECTED_ID"
+          echo "Shader profile ID: $PROFILE_ID"
           echo "DM_GAME=$PROFILE_ID" >> "$GITHUB_ENV"
           echo "DETECTED_TITLE_ID=$DETECTED_ID" >> "$GITHUB_ENV"
-          echo "Detected title ID: $DETECTED_ID"
-          echo "Shader profile ID: $PROFILE_ID"
 
       - name: Generate shader toolchain header
         shell: bash
         run: |
           set -euo pipefail
-          CHAIN_SCRIPT="$(find . -name dmsh_chain.py -type f -print -quit)"
+          echo "Preparing shader toolchain for profile $DM_GAME"
+
+          CHAIN_SCRIPT="$(
+            find . -name dmsh_chain.py -type f -print -quit
+          )"
+
           if [[ -z "$CHAIN_SCRIPT" ]]; then
             echo "::error::Could not find dmsh_chain.py"
             exit 1
           fi
+
           python "$CHAIN_SCRIPT" --header
 
       - name: Build unsigned IPA
@@ -475,6 +609,8 @@ jobs:
             echo "::error::IPA build did not produce an output file."
             exit 1
           fi
+
+          echo "IPA successfully created: $OUTPUT"
           ls -lh "$OUTPUT"
 
       - name: Upload IPA
