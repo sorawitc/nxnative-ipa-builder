@@ -75,17 +75,30 @@ jobs:
           download_file() {
             local url="$1"
             local output="$2"
+            local source_type
             local file_id
+            local share_api_url
+            local download_url
+            local result
+            local content_type
+            local temporary_output="${output}.part"
 
             if [[ -z "${url:-}" ]]; then
               echo "::error::A required download URL is empty."
               exit 1
             fi
 
-            file_id="$(python - "$url" <<'PY'
+            result="$(python - "$url" <<'PY'
+          import base64
           import re
           import sys
-          from urllib.parse import urlparse, parse_qs
+          from urllib.parse import (
+              parse_qsl,
+              parse_qs,
+              urlencode,
+              urlparse,
+              urlunparse,
+          )
 
           url = sys.argv[1].strip()
           parsed = urlparse(url)
@@ -107,17 +120,104 @@ jobs:
           ):
               file_id = url
 
-          if not file_id:
+          if file_id:
+              print(f"google|{file_id}||")
+              raise SystemExit(0)
+
+          host = (parsed.hostname or "").lower()
+          is_onedrive = (
+              host in ("1drv.ms", "onedrive.live.com")
+              or host.endswith(".sharepoint.com")
+              or host.endswith(".onedrive.com")
+          )
+
+          if parsed.scheme != "https" or not is_onedrive:
               raise SystemExit(
-                  "Could not extract a Google Drive file ID."
+                  "Unsupported download link. Use a Google Drive file ID "
+                  "or an HTTPS OneDrive sharing link."
               )
 
-          print(file_id)
+          share_id = "u!" + base64.urlsafe_b64encode(
+              url.encode()
+          ).decode().rstrip("=")
+          api_url = (
+              "https://api.onedrive.com/v1.0/shares/"
+              + share_id
+              + "/root/content"
+          )
+          download_query = [
+              (key, value)
+              for key, value in parse_qsl(
+                  parsed.query, keep_blank_values=True
+              )
+              if key.lower() != "download"
+          ]
+          download_query.append(("download", "1"))
+          download_url = urlunparse(
+              parsed._replace(query=urlencode(download_query))
+          )
+          print(f"onedrive||{api_url}|{download_url}")
           PY
           )"
 
             echo "Downloading $(basename "$output")..."
-            gdown "$file_id" -O "$output"
+            IFS='|' read -r \
+              source_type file_id share_api_url download_url <<< "$result"
+
+            if [[ "$source_type" == "google" ]]; then
+              gdown "$file_id" -O "$output"
+            else
+              if content_type="$(
+                curl --silent --show-error --fail --location \
+                  --retry 3 --connect-timeout 30 \
+                  --output "$temporary_output" \
+                  --write-out '%{content_type}' \
+                  "$download_url"
+              )" && [[ "$content_type" != text/html* ]] \
+                && ! python - "$temporary_output" <<'PY'
+          import sys
+          from pathlib import Path
+
+          prefix = Path(sys.argv[1]).read_bytes()[:2048].lstrip().lower()
+          raise SystemExit(
+              0 if prefix.startswith((b"<!doctype html", b"<html", b"<head"))
+              else 1
+          )
+          PY
+              then
+                mv "$temporary_output" "$output"
+              elif [[ "$source_type" == "onedrive" ]]; then
+                rm -f "$temporary_output"
+                if content_type="$(
+                  curl --silent --show-error --fail --location \
+                    --retry 3 --connect-timeout 30 \
+                    --output "$temporary_output" \
+                    --write-out '%{content_type}' \
+                    "$share_api_url"
+                )" && [[ "$content_type" != text/html* ]] \
+                  && ! python - "$temporary_output" <<'PY'
+          import sys
+          from pathlib import Path
+
+          prefix = Path(sys.argv[1]).read_bytes()[:2048].lstrip().lower()
+          raise SystemExit(
+              0 if prefix.startswith((b"<!doctype html", b"<html", b"<head"))
+              else 1
+          )
+          PY
+                then
+                  mv "$temporary_output" "$output"
+                else
+                  rm -f "$temporary_output"
+                  echo "::error::OneDrive did not return a file. Set sharing to 'Anyone with the link' and use a direct file sharing link."
+                  exit 1
+                fi
+              else
+                rm -f "$temporary_output"
+                echo "::error::The URL did not return a downloadable file."
+                exit 1
+              fi
+            fi
 
             if [[ ! -s "$output" ]]; then
               echo "::error::Downloaded file is empty."
