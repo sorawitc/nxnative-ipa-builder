@@ -77,6 +77,61 @@ jobs:
           echo "=== Metal compiler ==="
           xcrun metal --version 2>&1 || true
 
+      - name: Free up disk space
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "=== Disk space before cleanup ==="
+          df -h "$RUNNER_TEMP"
+
+          echo "=== Largest directories (diagnostics) ==="
+          sudo du -xhd1 /Applications /Library "$HOME" 2>/dev/null \
+            | sort -h | tail -25 || true
+
+          # Remove every Xcode except the one selected in the previous step.
+          SELECTED="$(xcode-select -p | sed 's|/Contents/Developer$||')"
+          SELECTED_REAL="$(cd "$SELECTED" && pwd -P)"
+          echo "Keeping Xcode: $SELECTED_REAL"
+          for app in /Applications/Xcode*.app; do
+            [[ -e "$app" ]] || continue
+            real="$(cd "$app" && pwd -P)"
+            if [[ "$real" != "$SELECTED_REAL" ]]; then
+              echo "Removing $app"
+              sudo rm -rf "$app"
+            fi
+          done
+
+          # Android SDK and other toolchains this build does not use.
+          for dir in \
+            "${ANDROID_HOME:-}" \
+            "${ANDROID_SDK_ROOT:-}" \
+            "$HOME/Library/Android"; do
+            if [[ -n "$dir" && -d "$dir" ]]; then
+              echo "Removing $dir"
+              sudo rm -rf "$dir"
+            fi
+          done
+
+          for tool in go node Ruby PyPy; do
+            dir="$HOME/hostedtoolcache/$tool"
+            if [[ -d "$dir" ]]; then
+              echo "Removing $dir"
+              sudo rm -rf "$dir"
+            fi
+          done
+
+          rm -rf "$HOME/Library/Caches"/* 2>/dev/null || true
+
+          echo "=== Disk space after cleanup ==="
+          df -h "$RUNNER_TEMP"
+
+          AVAIL_GB="$(df -k "$RUNNER_TEMP" | awk 'NR==2 {print int($4/1024/1024)}')"
+          echo "Available: ${AVAIL_GB} GB"
+          if (( AVAIL_GB < 45 )); then
+            echo "::warning::Only ${AVAIL_GB} GB free. A ~20 GB game plus the 21 GB build headroom needs roughly 45 GB."
+          fi
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
