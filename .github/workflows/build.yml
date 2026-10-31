@@ -712,21 +712,38 @@ jobs:
 
           python "$CHAIN_SCRIPT" --header
 
-      - name: Build unsigned IPA
+      - name: Build unsigned IPA (game files kept separate)
+        id: build
         shell: bash
         run: |
           set -euo pipefail
           WORK="$RUNNER_TEMP/nxnative"
           GAME_DIR="$RUNNER_TEMP/GameFiles"
           OUTPUT="$RUNNER_TEMP/NxNative.ipa"
+          ROMFS_OUT="$RUNNER_TEMP/romfs-out"
 
           echo "Disk space before build:"
           df -h "$RUNNER_TEMP"
 
+          # Keep the game files (RomFS) out of the IPA so it stays small
+          # enough to install. The switch differs between nxnative versions.
+          EXTRA_ARGS=()
+          HELP="$(python scripts/build_ipa_from_nsp.py --help 2>&1 || true)"
+          if grep -q -- '--romfs' <<< "$HELP" && grep -q 'separate' <<< "$HELP"; then
+            EXTRA_ARGS+=(--romfs separate)
+            echo "Using: --romfs separate"
+          elif grep -rqs 'DM_COPY_ROMFS' scripts dm/ios 2>/dev/null; then
+            export DM_COPY_ROMFS=NO
+            echo "Using: DM_COPY_ROMFS=NO"
+          else
+            echo "::warning::This nxnative version has no option to keep the RomFS out of the IPA; the IPA will contain the game files."
+          fi
+
           python scripts/build_ipa_from_nsp.py \
             "$GAME_DIR" \
             -k "$WORK/prod.keys" \
-            -o "$OUTPUT"
+            -o "$OUTPUT" \
+            ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}
 
           if [[ ! -s "$OUTPUT" ]]; then
             echo "::error::IPA build did not produce an output file."
@@ -735,6 +752,38 @@ jobs:
 
           echo "IPA successfully created: $OUTPUT"
           ls -lh "$OUTPUT"
+
+          # Show how this version copies the game files to a phone.
+          if [[ -f scripts/push_romfs.sh ]]; then
+            echo "=== scripts/push_romfs.sh (first 80 lines) ==="
+            sed -n '1,80p' scripts/push_romfs.sh
+          fi
+
+          # Find the RomFS image the app reads from Documents/romfs.img.
+          IMG=""
+          for root in "$GAME_DIR"/*_build/extract "$GAME_DIR"; do
+            if [[ -d "$root" ]]; then
+              IMG="$(find "$root" -type f -iname 'romfs.img' -size +100M -print -quit 2>/dev/null || true)"
+              if [[ -n "$IMG" ]]; then
+                break
+              fi
+            fi
+          done
+
+          if [[ -n "$IMG" ]]; then
+            mkdir -p "$ROMFS_OUT"
+            ln -f "$IMG" "$ROMFS_OUT/romfs.img"
+            echo "RomFS image: $IMG"
+            ls -lh "$ROMFS_OUT/romfs.img"
+            echo "romfs_found=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::warning::Could not find romfs.img. Large files under the game folder:"
+            find "$GAME_DIR" -type f -size +500M -exec ls -lh {} \; 2>/dev/null || true
+            echo "romfs_found=false" >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "Disk space after build:"
+          df -h "$RUNNER_TEMP"
 
       - name: Upload IPA
         if: success()
@@ -745,6 +794,16 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+      - name: Upload RomFS image (copy to the phone as Documents/romfs.img)
+        if: success() && steps.build.outputs.romfs_found == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: NxNative-RomFS-img
+          path: ${{ runner.temp }}/romfs-out/romfs.img
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 3
+
       - name: Upload build logs if available
         if: always()
         uses: actions/upload-artifact@v4
@@ -752,7 +811,8 @@ jobs:
           name: NxNative-Build-Logs
           path: |
             ${{ runner.temp }}/GameFiles/*_build/logs/
-            ${{ runner.temp }}/GameFiles/*_survey/
+            ${{ runner.temp }}/GameFiles/*_survey/logs/
+            ${{ runner.temp }}/GameFiles/*_survey/survey.md
           if-no-files-found: ignore
           retention-days: 7
 
