@@ -765,11 +765,19 @@ jobs:
           # ends, so a run cancelled at the 6 h limit still persists its
           # progress for actions/cache to save. The trap fires on normal exit
           # and on the SIGTERM GitHub sends when it cancels the job.
+          SYNCED=0
           sync_cache() {
+            [[ "$SYNCED" -eq 1 ]] && return 0
+            SYNCED=1
             if [[ -d "$BUILD_CACHE" ]]; then
               echo "Syncing shader cache back to $CACHE_DIR"
               mkdir -p "$CACHE_DIR"
-              cp -a "$BUILD_CACHE/." "$CACHE_DIR/" 2>/dev/null || true
+              # Prefer hardlink clones (-al) so the sync is near-instant and
+              # does not double the disk usage of a multi-GB cache; fall back
+              # to a plain copy if the two paths are on different volumes.
+              cp -al "$BUILD_CACHE/." "$CACHE_DIR/" 2>/dev/null \
+                || cp -a "$BUILD_CACHE/." "$CACHE_DIR/" 2>/dev/null \
+                || true
               du -sh "$CACHE_DIR" 2>/dev/null || true
             fi
           }
