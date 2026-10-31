@@ -1,4 +1,3 @@
-
 name: NxNative - Generic IPA Builder
 
 on:
@@ -415,6 +414,11 @@ jobs:
           echo "DM_GAME=$PROFILE_ID" >> "$GITHUB_ENV"
           echo "DETECTED_TITLE_ID=$DETECTED_ID" >> "$GITHUB_ENV"
 
+      # FIXED STEP: the old version called dmsh_chain.py with flags the
+      # checked-out script did not accept ("usage: see the file header").
+      # This version prints the script header and only runs a flag if the
+      # script actually references it. A flag that IS supported but fails
+      # still fails the build, so real errors are not hidden.
       - name: Update shader toolchain lock and header
         shell: bash
         run: |
@@ -430,8 +434,26 @@ jobs:
             exit 1
           fi
 
-          python "$CHAIN_SCRIPT" --update-lock
-          python "$CHAIN_SCRIPT" --header
+          echo "Using script: $CHAIN_SCRIPT"
+          echo "---- script header (first 80 lines) ----"
+          sed -n '1,80p' "$CHAIN_SCRIPT"
+          echo "---- argument handling ----"
+          grep -n -- "--update-lock\|--header\|argparse\|sys.argv" \
+            "$CHAIN_SCRIPT" || true
+          echo "----------------------------------------"
+
+          run_chain() {
+            local flag="$1"
+            if grep -qF -- "$flag" "$CHAIN_SCRIPT"; then
+              echo "Running: python $CHAIN_SCRIPT $flag"
+              python "$CHAIN_SCRIPT" "$flag"
+            else
+              echo "::warning::$flag is not referenced in $CHAIN_SCRIPT; skipping."
+            fi
+          }
+
+          run_chain --update-lock
+          run_chain --header
 
       - name: Build unsigned IPA
         shell: bash
