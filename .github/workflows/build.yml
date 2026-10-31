@@ -87,32 +87,42 @@ jobs:
           host = parsed.netloc.lower()
           query = parse_qs(parsed.query, keep_blank_values=True)
 
+          def note(kind):
+              print(f"Link type: {kind}", file=sys.stderr)
+
+
           if host in ("drive.google.com", "www.drive.google.com", "docs.google.com"):
               match = re.search(r"/d/([^/]+)", parsed.path)
               file_id = match.group(1) if match else (query.get("id") or [None])[0]
               if not file_id:
                   raise SystemExit("Could not extract a Google Drive file ID.")
+              note("google-drive")
               print(
                   "https://drive.usercontent.google.com/download"
                   f"?id={file_id}&export=download&confirm=t"
               )
 
           elif host == "dropbox.com" or host.endswith(".dropbox.com"):
+              note("dropbox")
               query["dl"] = ["1"]
               print(urlunparse(parsed._replace(query=urlencode(query, doseq=True))))
 
           elif host in ("1drv.ms", "onedrive.live.com", "www.onedrive.live.com"):
+              note("onedrive-personal")
               token = base64.urlsafe_b64encode(raw.encode()).decode().rstrip("=")
               print(f"https://api.onedrive.com/v1.0/shares/u!{token}/root/content")
 
           elif host.endswith(".sharepoint.com"):
+              note("sharepoint")
               query["download"] = ["1"]
               print(urlunparse(parsed._replace(query=urlencode(query, doseq=True))))
 
           elif parsed.scheme in ("http", "https"):
+              note("direct-link")
               print(raw)
 
           elif re.fullmatch(r"[-A-Za-z0-9_]{20,}", raw):
+              note("google-drive-id")
               print(
                   "https://drive.usercontent.google.com/download"
                   f"?id={raw}&export=download&confirm=t"
