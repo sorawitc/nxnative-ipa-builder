@@ -1,3 +1,4 @@
+
 name: NxNative - Generic IPA Builder
 
 on:
@@ -22,7 +23,10 @@ permissions:
 
 jobs:
   build:
-    runs-on: macos-latest
+    # nxnative needs the Xcode 27.1 / iOS 27 SDK (CMMotionManager.deviceMotionBody,
+    # and the Metal toolchain the shaders were tested with). macos-latest still
+    # resolves to an older image, so pin the macOS 27 image explicitly.
+    runs-on: macos-27
     timeout-minutes: 360
 
     steps:
@@ -40,6 +44,40 @@ jobs:
           repository: seedds/nxnative
           ref: main
 
+      - name: Select Xcode 27.1 and verify toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # On the macos-27 image Xcode 27.1 may be named either
+          # Xcode_27.1.app or Xcode_27.1_Release_Candidate.app
+          # (actions/runner-images issue #15000). Pick whichever exists.
+          XCODE_APP=""
+          for candidate in \
+            /Applications/Xcode_27.1.app \
+            /Applications/Xcode_27.1_Release_Candidate.app; do
+            if [[ -d "$candidate" ]]; then
+              XCODE_APP="$candidate"
+              break
+            fi
+          done
+
+          if [[ -z "$XCODE_APP" ]]; then
+            echo "::error::Xcode 27.1 was not found on this runner. Installed Xcodes:"
+            ls -d /Applications/Xcode*.app 2>/dev/null || true
+            exit 1
+          fi
+
+          echo "Selecting $XCODE_APP"
+          sudo xcode-select -s "$XCODE_APP/Contents/Developer"
+
+          echo "=== Xcode ==="
+          xcodebuild -version
+          echo "=== iOS SDKs ==="
+          xcodebuild -showsdks | grep -i ios || true
+          echo "=== Metal compiler ==="
+          xcrun metal --version 2>&1 || true
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
@@ -54,9 +92,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          brew install xcodegen zstd spirv-cross unar glslang
-          command -v glslangValidator
-          glslangValidator --version | head -n 3
+          brew install glslang xcodegen zstd spirv-cross unar
           python -m pip install --upgrade pip
           python -m pip install \
             lz4 capstone fonttools backports.zstd gdown
@@ -73,132 +109,226 @@ jobs:
           WORK="$RUNNER_TEMP/nxnative"
           mkdir -p "$WORK"
 
-          # Convert a share link (Google Drive, OneDrive, Dropbox, or a
-          # plain direct link) into a direct-download URL.
-          resolve_url() {
-            python - "$1" <<'PY'
-          import base64
-          import re
+          download_candidate() {
+            local url="$1"
+            local output="$2"
+            local response
+            local content_type
+            local cookie_jar
+            local curl_status
+
+            # OneDrive/SharePoint sharing links set cookies during the
+            # redirect chain; without a cookie jar curl lands on the
+            # sign-in page (HTTP 200 + HTML) instead of the file.
+            cookie_jar="$(mktemp)"
+
+            EFFECTIVE_URL=""
+            response="$(
+              curl --silent --show-error --fail --location \
+                --retry 3 --connect-timeout 30 \
+                --cookie-jar "$cookie_jar" --cookie "$cookie_jar" \
+                --user-agent 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36 Edg/129.0.0.0' \
+                --header 'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8' \
+                --header 'Accept-Language: en-US,en;q=0.9' \
+                --output "$output" \
+                --write-out '%{content_type}\n%{url_effective}' \
+                "$url"
+            )"
+            curl_status=$?
+            rm -f "$cookie_jar"
+
+            if [[ "$curl_status" -ne 0 ]]; then
+              return 1
+            fi
+
+            content_type="${response%%$'\n'*}"
+            EFFECTIVE_URL="${response#*$'\n'}"
+            [[ "$content_type" != text/html* ]] \
+              && ! python - "$output" <<'PY'
           import sys
-          from urllib.parse import urlencode, urlparse, parse_qs, urlunparse
+          from pathlib import Path
 
-          raw = sys.argv[1].strip()
-          parsed = urlparse(raw)
-          host = parsed.netloc.lower()
-          query = parse_qs(parsed.query, keep_blank_values=True)
-
-          def note(kind):
-              print(f"Link type: {kind}", file=sys.stderr)
-
-
-          if host in ("drive.google.com", "www.drive.google.com", "docs.google.com"):
-              match = re.search(r"/d/([^/]+)", parsed.path)
-              file_id = match.group(1) if match else (query.get("id") or [None])[0]
-              if not file_id:
-                  raise SystemExit("Could not extract a Google Drive file ID.")
-              note("google-drive")
-              print(
-                  "https://drive.usercontent.google.com/download"
-                  f"?id={file_id}&export=download&confirm=t"
-              )
-
-          elif host == "dropbox.com" or host.endswith(".dropbox.com"):
-              note("dropbox")
-              query["dl"] = ["1"]
-              print(urlunparse(parsed._replace(query=urlencode(query, doseq=True))))
-
-          elif host in ("1drv.ms", "onedrive.live.com", "www.onedrive.live.com"):
-              note("onedrive-personal")
-              token = base64.urlsafe_b64encode(raw.encode()).decode().rstrip("=")
-              print(f"https://api.onedrive.com/v1.0/shares/u!{token}/root/content")
-
-          elif host.endswith(".sharepoint.com"):
-              note("sharepoint")
-              query["download"] = ["1"]
-              print(urlunparse(parsed._replace(query=urlencode(query, doseq=True))))
-
-          elif parsed.scheme in ("http", "https"):
-              note("direct-link")
-              print(raw)
-
-          elif re.fullmatch(r"[-A-Za-z0-9_]{20,}", raw):
-              note("google-drive-id")
-              print(
-                  "https://drive.usercontent.google.com/download"
-                  f"?id={raw}&export=download&confirm=t"
-              )
-
-          else:
-              raise SystemExit("Unrecognized download URL format.")
+          prefix = Path(sys.argv[1]).read_bytes()[:2048].lstrip().lower()
+          raise SystemExit(
+              0 if prefix.startswith((b"<!doctype html", b"<html", b"<head"))
+              else 1
+          )
           PY
-          }
-
-          # Fallback for OneDrive personal links: follow the share link and
-          # build an onedrive.live.com/download URL from its parameters.
-          onedrive_fallback_url() {
-            python - "$1" <<'PY'
-          import sys
-          from urllib.parse import urlparse, parse_qs, urlencode
-
-          u = urlparse(sys.argv[1])
-          if not u.netloc.lower().endswith("onedrive.live.com"):
-              raise SystemExit(1)
-
-          q = parse_qs(u.query)
-          keep = {}
-          for key in ("cid", "resid", "authkey"):
-              if q.get(key):
-                  keep[key] = q[key]
-          if "resid" not in keep and q.get("id"):
-              keep["resid"] = q["id"]
-          if "resid" not in keep:
-              raise SystemExit(1)
-
-          print("https://onedrive.live.com/download?" + urlencode(keep, doseq=True))
-          PY
-          }
-
-          fetch() {
-            curl --fail --location --silent --show-error \
-              --retry "$3" --retry-delay 10 --retry-all-errors \
-              --connect-timeout 30 \
-              -C - \
-              -o "$2" \
-              "$1"
           }
 
           download_file() {
             local url="$1"
             local output="$2"
-            local direct alt final
+            local source_type
+            local file_id
+            local share_api_url
+            local resolved_share_api_url
+            local api_candidate
+            local last_api_candidate
+            local downloaded
+            local download_url
+            local result
+            local temporary_output="${output}.part"
 
             if [[ -z "${url:-}" ]]; then
               echo "::error::A required download URL is empty."
               exit 1
             fi
 
-            direct="$(resolve_url "$url")"
-            echo "::add-mask::$direct"
+            result="$(python - "$url" <<'PY'
+          import base64
+          import re
+          import sys
+          from urllib.parse import (
+              parse_qsl,
+              parse_qs,
+              urlencode,
+              urlparse,
+              urlunparse,
+          )
+
+          url = sys.argv[1].strip()
+          parsed = urlparse(url)
+          query = parse_qs(parsed.query)
+          file_id = None
+
+          if parsed.netloc.lower() in (
+              "drive.google.com",
+              "www.drive.google.com",
+          ):
+              match = re.search(r"/file/d/([^/]+)", parsed.path)
+              if match:
+                  file_id = match.group(1)
+              elif query.get("id"):
+                  file_id = query["id"][0]
+
+          if not file_id and re.fullmatch(
+              r"[-A-Za-z0-9_]{20,}", url
+          ):
+              file_id = url
+
+          if file_id:
+              print(f"google|{file_id}||")
+              raise SystemExit(0)
+
+          host = (parsed.hostname or "").lower()
+          is_onedrive = (
+              host in ("1drv.ms", "onedrive.live.com")
+              or host.endswith(".sharepoint.com")
+              or host.endswith(".onedrive.com")
+          )
+
+          if parsed.scheme != "https" or not is_onedrive:
+              raise SystemExit(
+                  "Unsupported download link. Use a Google Drive file ID "
+                  "or an HTTPS OneDrive sharing link."
+              )
+
+          share_id = "u!" + base64.urlsafe_b64encode(
+              url.encode()
+          ).decode().rstrip("=")
+          api_url = (
+              "https://api.onedrive.com/v1.0/shares/"
+              + share_id
+              + "/root/content"
+          )
+          download_query = [
+              (key, value)
+              for key, value in parse_qsl(
+                  parsed.query, keep_blank_values=True
+              )
+              if key.lower() != "download"
+          ]
+          download_query.append(("download", "1"))
+          download_url = urlunparse(
+              parsed._replace(query=urlencode(download_query))
+          )
+          print(f"onedrive||{api_url}|{download_url}")
+          PY
+          )"
 
             echo "Downloading $(basename "$output")..."
-            if ! fetch "$direct" "$output" 2; then
-              rm -f "$output"
-              alt=""
+            IFS='|' read -r \
+              source_type file_id share_api_url download_url <<< "$result"
 
-              if [[ "$url" =~ ^https?://(1drv\.ms|(www\.)?onedrive\.live\.com)/ ]]; then
-                echo "Primary OneDrive method failed; trying fallback."
-                final="$(curl -sL -r 0-0 -o /dev/null --max-time 60 \
-                  -w '%{url_effective}' "$url" || true)"
-                alt="$(onedrive_fallback_url "$final" || true)"
-              fi
+            if [[ "$source_type" == "google" ]]; then
+              gdown "$file_id" -O "$output"
+            else
+              if download_candidate "$download_url" "$temporary_output"; then
+                mv "$temporary_output" "$output"
+              elif [[ "$source_type" == "onedrive" ]]; then
+                rm -f "$temporary_output"
+                resolved_share_api_url="$(
+                  python - "$EFFECTIVE_URL" "$share_api_url" <<'PY'
+          import base64
+          import sys
+          from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 
-              if [[ -z "$alt" ]]; then
-                echo "::error::Download failed. For HTTP 401/403 the link is not public: set sharing to 'Anyone with the link' (personal account) and update the secret."
+          url, fallback = sys.argv[1:]
+          parsed = urlparse(url)
+          host = (parsed.hostname or "").lower()
+          is_onedrive = (
+              host in ("1drv.ms", "onedrive.live.com")
+              or host.endswith(".sharepoint.com")
+              or host.endswith(".onedrive.com")
+          )
+
+          if parsed.scheme != "https" or not is_onedrive:
+              print(fallback)
+              raise SystemExit(0)
+
+          query = [
+              (key, value)
+              for key, value in parse_qsl(
+                  parsed.query, keep_blank_values=True
+              )
+              if key.lower() != "download"
+          ]
+          canonical_url = urlunparse(
+              parsed._replace(query=urlencode(query))
+          )
+          share_id = "u!" + base64.urlsafe_b64encode(
+              canonical_url.encode()
+          ).decode().rstrip("=")
+          print(
+              "https://api.onedrive.com/v1.0/shares/"
+              + share_id
+              + "/root/content"
+          )
+          PY
+                )"
+                downloaded="false"
+                last_api_candidate=""
+                for api_candidate in \
+                  "$resolved_share_api_url" "$share_api_url"; do
+                  if [[ "$downloaded" == "true" ]] \
+                    || [[ "$api_candidate" == "$last_api_candidate" ]]; then
+                    continue
+                  fi
+                  last_api_candidate="$api_candidate"
+
+                  if [[ -s "$temporary_output" ]]; then
+                    rm -f "$temporary_output"
+                  fi
+
+                  if download_candidate \
+                    "$api_candidate" "$temporary_output"; then
+                    mv "$temporary_output" "$output"
+                    downloaded="true"
+                    break
+                  fi
+                done
+
+                if [[ "$downloaded" != "true" ]]; then
+                  rm -f "$temporary_output"
+                  echo "::error::OneDrive did not return a file. Set sharing to 'Anyone with the link' and use a direct file sharing link."
+                  exit 1
+                fi
+              else
+                rm -f "$temporary_output"
+                echo "::error::The URL did not return a downloadable file."
                 exit 1
               fi
-
-              echo "::add-mask::$alt"
-              fetch "$alt" "$output" 3
             fi
 
             if [[ ! -s "$output" ]]; then
@@ -206,13 +336,6 @@ jobs:
               exit 1
             fi
 
-            if head -c 512 "$output" | grep -qaiE '<!doctype html|<html'; then
-              echo "::error::Received an HTML page instead of the file. The link is not a direct download, is private, or is blocked."
-              rm -f "$output"
-              exit 1
-            fi
-
-            ls -lh "$output"
             file "$output"
           }
 
@@ -504,12 +627,7 @@ jobs:
           echo "DM_GAME=$PROFILE_ID" >> "$GITHUB_ENV"
           echo "DETECTED_TITLE_ID=$DETECTED_ID" >> "$GITHUB_ENV"
 
-      # FIXED STEP: the old version called dmsh_chain.py with flags the
-      # checked-out script did not accept ("usage: see the file header").
-      # This version prints the script header and only runs a flag if the
-      # script actually references it. A flag that IS supported but fails
-      # still fails the build, so real errors are not hidden.
-      - name: Update shader toolchain lock and header
+      - name: Generate shader toolchain header
         shell: bash
         run: |
           set -euo pipefail
@@ -524,26 +642,7 @@ jobs:
             exit 1
           fi
 
-          echo "Using script: $CHAIN_SCRIPT"
-          echo "---- script header (first 80 lines) ----"
-          sed -n '1,80p' "$CHAIN_SCRIPT"
-          echo "---- argument handling ----"
-          grep -n -- "--update-lock\|--header\|argparse\|sys.argv" \
-            "$CHAIN_SCRIPT" || true
-          echo "----------------------------------------"
-
-          run_chain() {
-            local flag="$1"
-            if grep -qF -- "$flag" "$CHAIN_SCRIPT"; then
-              echo "Running: python $CHAIN_SCRIPT $flag"
-              python "$CHAIN_SCRIPT" "$flag"
-            else
-              echo "::warning::$flag is not referenced in $CHAIN_SCRIPT; skipping."
-            fi
-          }
-
-          run_chain --update-lock
-          run_chain --header
+          python "$CHAIN_SCRIPT" --header
 
       - name: Build unsigned IPA
         shell: bash
