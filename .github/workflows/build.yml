@@ -133,10 +133,44 @@ jobs:
           PY
           }
 
+          # Fallback for OneDrive personal links: follow the share link and
+          # build an onedrive.live.com/download URL from its parameters.
+          onedrive_fallback_url() {
+            python - "$1" <<'PY'
+          import sys
+          from urllib.parse import urlparse, parse_qs, urlencode
+
+          u = urlparse(sys.argv[1])
+          if not u.netloc.lower().endswith("onedrive.live.com"):
+              raise SystemExit(1)
+
+          q = parse_qs(u.query)
+          keep = {}
+          for key in ("cid", "resid", "authkey"):
+              if q.get(key):
+                  keep[key] = q[key]
+          if "resid" not in keep and q.get("id"):
+              keep["resid"] = q["id"]
+          if "resid" not in keep:
+              raise SystemExit(1)
+
+          print("https://onedrive.live.com/download?" + urlencode(keep, doseq=True))
+          PY
+          }
+
+          fetch() {
+            curl --fail --location --silent --show-error \
+              --retry "$3" --retry-delay 10 --retry-all-errors \
+              --connect-timeout 30 \
+              -C - \
+              -o "$2" \
+              "$1"
+          }
+
           download_file() {
             local url="$1"
             local output="$2"
-            local direct
+            local direct alt final
 
             if [[ -z "${url:-}" ]]; then
               echo "::error::A required download URL is empty."
@@ -147,12 +181,25 @@ jobs:
             echo "::add-mask::$direct"
 
             echo "Downloading $(basename "$output")..."
-            curl --fail --location --silent --show-error \
-              --retry 5 --retry-delay 15 --retry-all-errors \
-              --connect-timeout 30 \
-              -C - \
-              -o "$output" \
-              "$direct"
+            if ! fetch "$direct" "$output" 2; then
+              rm -f "$output"
+              alt=""
+
+              if [[ "$url" =~ ^https?://(1drv\.ms|(www\.)?onedrive\.live\.com)/ ]]; then
+                echo "Primary OneDrive method failed; trying fallback."
+                final="$(curl -sL -r 0-0 -o /dev/null --max-time 60 \
+                  -w '%{url_effective}' "$url" || true)"
+                alt="$(onedrive_fallback_url "$final" || true)"
+              fi
+
+              if [[ -z "$alt" ]]; then
+                echo "::error::Download failed. For HTTP 401/403 the link is not public: set sharing to 'Anyone with the link' (personal account) and update the secret."
+                exit 1
+              fi
+
+              echo "::add-mask::$alt"
+              fetch "$alt" "$output" 3
+            fi
 
             if [[ ! -s "$output" ]]; then
               echo "::error::Downloaded file is empty."
