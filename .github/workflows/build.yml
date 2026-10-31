@@ -740,12 +740,12 @@ jobs:
           echo "Disk space before build:"
           df -h "$RUNNER_TEMP"
 
-          # Speed up shader compilation: dmsh_build.py parallelises across J
-          # threads (default 8). Match it to the runner's core count so the
-          # Metal compiles saturate every core. This is the main lever for a
-          # faster build; it does not change the output.
-          CORES="$(sysctl -n hw.logicalcpu 2>/dev/null || echo 8)"
-          export J="${DMSH_JOBS:-$CORES}"
+          # Shader compilation parallelism. dmsh_build.py defaults J to 8.
+          # This runner reports only 3 logical cores, but each shader compile
+          # mixes CPU and process/IO wait, so a little over-subscription helps
+          # overlap it. Use ~2x the core count; override with DMSH_JOBS.
+          CORES="$(sysctl -n hw.logicalcpu 2>/dev/null || echo 3)"
+          export J="${DMSH_JOBS:-$((CORES * 2))}"
           echo "Shader build concurrency J=$J (runner has $CORES logical cores)"
 
           # Seed the build's shader cache from the persisted one (if any), so
@@ -805,19 +805,38 @@ jobs:
           # take roughly an hour, so leave a wide margin: 16,200 s = 4 h 30 m,
           # which still leaves well over an hour under the 6 h job cap for the
           # cache sync and the actions/cache post-step upload.
+          # macOS has no GNU `timeout`, so enforce the budget ourselves: run
+          # the build in the background and poll, killing it (and giving the
+          # trap a chance to sync the cache) if it runs past the budget.
           BUILD_BUDGET="${BUILD_BUDGET_SECONDS:-16200}"
           set +e
-          timeout --signal=TERM "$BUILD_BUDGET" \
-            python scripts/build_ipa_from_nsp.py \
-              "$GAME_DIR" \
-              -k "$WORK/prod.keys" \
-              -o "$OUTPUT" \
-              ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}
+          python scripts/build_ipa_from_nsp.py \
+            "$GAME_DIR" \
+            -k "$WORK/prod.keys" \
+            -o "$OUTPUT" \
+            ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"} &
+          BUILD_PID=$!
+
+          TIMED_OUT=0
+          ELAPSED=0
+          while kill -0 "$BUILD_PID" 2>/dev/null; do
+            if [[ "$ELAPSED" -ge "$BUILD_BUDGET" ]]; then
+              echo "Build budget of ${BUILD_BUDGET}s reached; stopping the build to save the shader cache."
+              TIMED_OUT=1
+              kill -TERM "$BUILD_PID" 2>/dev/null
+              # give it a moment to exit, then force it
+              for _ in $(seq 1 30); do kill -0 "$BUILD_PID" 2>/dev/null || break; sleep 1; done
+              kill -KILL "$BUILD_PID" 2>/dev/null
+              break
+            fi
+            sleep 10
+            ELAPSED=$((ELAPSED + 10))
+          done
+          wait "$BUILD_PID"
           BUILD_RC=$?
           set -e
 
-          # timeout exits 124 when it had to interrupt the build.
-          if [[ "$BUILD_RC" -eq 124 ]]; then
+          if [[ "$TIMED_OUT" -eq 1 ]]; then
             sync_cache
             echo "::error::The build hit the ${BUILD_BUDGET}s budget before finishing (likely still compiling shaders). The shader cache was saved; re-run this workflow to resume from it."
             exit 1
