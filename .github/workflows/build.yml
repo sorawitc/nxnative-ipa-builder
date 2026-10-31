@@ -26,7 +26,7 @@ jobs:
     # nxnative needs the Xcode 27.1 / iOS 27 SDK (CMMotionManager.deviceMotionBody,
     # and the Metal toolchain the shaders were tested with). macos-latest still
     # resolves to an older image, so pin the macOS 27 image explicitly.
-    runs-on: macos-27
+    runs-on: macos-latest
     timeout-minutes: 360
 
     steps:
