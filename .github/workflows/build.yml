@@ -712,6 +712,20 @@ jobs:
 
           python "$CHAIN_SCRIPT" --header
 
+      # Shader compilation for a large game (Dragon Quest VII: 62,901 shaders,
+      # ~7 h) can exceed GitHub's hard 6 h job limit. dmsh_build reuses an
+      # existing shader cache, so persist it across runs: a cancelled run
+      # keeps whatever it compiled, and the next run resumes from there.
+      # After enough runs the cache is complete and the build finishes.
+      - name: Restore shader cache
+        id: shader_cache
+        uses: actions/cache@v4
+        with:
+          path: shader-cache
+          key: shader-cache-${{ inputs.device }}-${{ github.run_id }}
+          restore-keys: |
+            shader-cache-${{ inputs.device }}-
+
       - name: Build unsigned IPA (game files kept separate)
         id: build
         shell: bash
@@ -721,9 +735,45 @@ jobs:
           GAME_DIR="$RUNNER_TEMP/GameFiles"
           OUTPUT="$RUNNER_TEMP/NxNative.ipa"
           ROMFS_OUT="$RUNNER_TEMP/romfs-out"
+          CACHE_DIR="$GITHUB_WORKSPACE/shader-cache"
 
           echo "Disk space before build:"
           df -h "$RUNNER_TEMP"
+
+          # Speed up shader compilation: dmsh_build.py parallelises across J
+          # threads (default 8). Match it to the runner's core count so the
+          # Metal compiles saturate every core. This is the main lever for a
+          # faster build; it does not change the output.
+          CORES="$(sysctl -n hw.logicalcpu 2>/dev/null || echo 8)"
+          export J="${DMSH_JOBS:-$CORES}"
+          echo "Shader build concurrency J=$J (runner has $CORES logical cores)"
+
+          # Seed the build's shader cache from the persisted one (if any), so
+          # dmsh_build recompiles only shaders not yet done. The build folder
+          # lives under $GAME_DIR once extraction has run; create the target
+          # and copy the restored cache into place before the build starts.
+          BUILD_CACHE="$GAME_DIR/${DM_GAME}_build/shader/cache"
+          if [[ -d "$CACHE_DIR" ]]; then
+            echo "Restoring shader cache ($(du -sh "$CACHE_DIR" | cut -f1)) into the build folder"
+            mkdir -p "$BUILD_CACHE"
+            cp -a "$CACHE_DIR/." "$BUILD_CACHE/"
+          else
+            echo "No shader cache to restore (first run or cache miss)."
+          fi
+
+          # Always copy the compiled shader cache back out before the job
+          # ends, so a run cancelled at the 6 h limit still persists its
+          # progress for actions/cache to save. The trap fires on normal exit
+          # and on the SIGTERM GitHub sends when it cancels the job.
+          sync_cache() {
+            if [[ -d "$BUILD_CACHE" ]]; then
+              echo "Syncing shader cache back to $CACHE_DIR"
+              mkdir -p "$CACHE_DIR"
+              cp -a "$BUILD_CACHE/." "$CACHE_DIR/" 2>/dev/null || true
+              du -sh "$CACHE_DIR" 2>/dev/null || true
+            fi
+          }
+          trap 'sync_cache' EXIT TERM
 
           # Keep the game files (RomFS) out of the IPA so it stays small
           # enough to install. The switch differs between nxnative versions.
@@ -739,11 +789,34 @@ jobs:
             echo "::warning::This nxnative version has no option to keep the RomFS out of the IPA; the IPA will contain the game files."
           fi
 
-          python scripts/build_ipa_from_nsp.py \
-            "$GAME_DIR" \
-            -k "$WORK/prod.keys" \
-            -o "$OUTPUT" \
-            ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}
+          # Stop the build gracefully well before GitHub's 6 h hard limit so
+          # the shader cache can be copied out in full and persisted. If the
+          # build is still going at this point it is interrupted; the shader
+          # cache keeps what was compiled, and the next run resumes. The
+          # earlier steps (download ~13 GB, extract, rewrite, shader split)
+          # take roughly an hour, so leave a wide margin: 16,200 s = 4 h 30 m,
+          # which still leaves well over an hour under the 6 h job cap for the
+          # cache sync and the actions/cache post-step upload.
+          BUILD_BUDGET="${BUILD_BUDGET_SECONDS:-16200}"
+          set +e
+          timeout --signal=TERM "$BUILD_BUDGET" \
+            python scripts/build_ipa_from_nsp.py \
+              "$GAME_DIR" \
+              -k "$WORK/prod.keys" \
+              -o "$OUTPUT" \
+              ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}
+          BUILD_RC=$?
+          set -e
+
+          # timeout exits 124 when it had to interrupt the build.
+          if [[ "$BUILD_RC" -eq 124 ]]; then
+            sync_cache
+            echo "::error::The build hit the ${BUILD_BUDGET}s budget before finishing (likely still compiling shaders). The shader cache was saved; re-run this workflow to resume from it."
+            exit 1
+          elif [[ "$BUILD_RC" -ne 0 ]]; then
+            echo "::error::build_ipa_from_nsp.py exited with code $BUILD_RC."
+            exit "$BUILD_RC"
+          fi
 
           if [[ ! -s "$OUTPUT" ]]; then
             echo "::error::IPA build did not produce an output file."
