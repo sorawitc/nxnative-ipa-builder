@@ -73,58 +73,89 @@ jobs:
           WORK="$RUNNER_TEMP/nxnative"
           mkdir -p "$WORK"
 
+          # Convert a share link (Google Drive, OneDrive, Dropbox, or a
+          # plain direct link) into a direct-download URL.
+          resolve_url() {
+            python - "$1" <<'PY'
+          import base64
+          import re
+          import sys
+          from urllib.parse import urlencode, urlparse, parse_qs, urlunparse
+
+          raw = sys.argv[1].strip()
+          parsed = urlparse(raw)
+          host = parsed.netloc.lower()
+          query = parse_qs(parsed.query, keep_blank_values=True)
+
+          if host in ("drive.google.com", "www.drive.google.com", "docs.google.com"):
+              match = re.search(r"/d/([^/]+)", parsed.path)
+              file_id = match.group(1) if match else (query.get("id") or [None])[0]
+              if not file_id:
+                  raise SystemExit("Could not extract a Google Drive file ID.")
+              print(
+                  "https://drive.usercontent.google.com/download"
+                  f"?id={file_id}&export=download&confirm=t"
+              )
+
+          elif host == "dropbox.com" or host.endswith(".dropbox.com"):
+              query["dl"] = ["1"]
+              print(urlunparse(parsed._replace(query=urlencode(query, doseq=True))))
+
+          elif host in ("1drv.ms", "onedrive.live.com", "www.onedrive.live.com"):
+              token = base64.urlsafe_b64encode(raw.encode()).decode().rstrip("=")
+              print(f"https://api.onedrive.com/v1.0/shares/u!{token}/root/content")
+
+          elif host.endswith(".sharepoint.com"):
+              query["download"] = ["1"]
+              print(urlunparse(parsed._replace(query=urlencode(query, doseq=True))))
+
+          elif parsed.scheme in ("http", "https"):
+              print(raw)
+
+          elif re.fullmatch(r"[-A-Za-z0-9_]{20,}", raw):
+              print(
+                  "https://drive.usercontent.google.com/download"
+                  f"?id={raw}&export=download&confirm=t"
+              )
+
+          else:
+              raise SystemExit("Unrecognized download URL format.")
+          PY
+          }
+
           download_file() {
             local url="$1"
             local output="$2"
-            local file_id
+            local direct
 
             if [[ -z "${url:-}" ]]; then
               echo "::error::A required download URL is empty."
               exit 1
             fi
 
-            file_id="$(python - "$url" <<'PY'
-          import re
-          import sys
-          from urllib.parse import urlparse, parse_qs
-
-          url = sys.argv[1].strip()
-          parsed = urlparse(url)
-          query = parse_qs(parsed.query)
-          file_id = None
-
-          if parsed.netloc.lower() in (
-              "drive.google.com",
-              "www.drive.google.com",
-          ):
-              match = re.search(r"/file/d/([^/]+)", parsed.path)
-              if match:
-                  file_id = match.group(1)
-              elif query.get("id"):
-                  file_id = query["id"][0]
-
-          if not file_id and re.fullmatch(
-              r"[-A-Za-z0-9_]{20,}", url
-          ):
-              file_id = url
-
-          if not file_id:
-              raise SystemExit(
-                  "Could not extract a Google Drive file ID."
-              )
-
-          print(file_id)
-          PY
-          )"
+            direct="$(resolve_url "$url")"
+            echo "::add-mask::$direct"
 
             echo "Downloading $(basename "$output")..."
-            gdown "$file_id" -O "$output"
+            curl --fail --location --silent --show-error \
+              --retry 5 --retry-delay 15 --retry-all-errors \
+              --connect-timeout 30 \
+              -C - \
+              -o "$output" \
+              "$direct"
 
             if [[ ! -s "$output" ]]; then
               echo "::error::Downloaded file is empty."
               exit 1
             fi
 
+            if head -c 512 "$output" | grep -qaiE '<!doctype html|<html'; then
+              echo "::error::Received an HTML page instead of the file. The link is not a direct download, is private, or is blocked."
+              rm -f "$output"
+              exit 1
+            fi
+
+            ls -lh "$output"
             file "$output"
           }
 
