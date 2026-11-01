@@ -726,14 +726,18 @@ jobs:
       # existing shader cache, so persist it across runs: a cancelled run
       # keeps whatever it compiled, and the next run resumes from there.
       # After enough runs the cache is complete and the build finishes.
+      # restore-only here; the matching save step runs after the build with
+      # `if: always()`, so progress is kept even when the build step fails
+      # or hits its time budget (actions/cache@v4 only saves on success).
+      # "metal922" in the key keeps caches from different Metal compilers apart.
       - name: Restore shader cache
         id: shader_cache
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: shader-cache
-          key: shader-cache-${{ inputs.device }}-${{ github.run_id }}
+          key: shader-cache-metal922-${{ inputs.device }}-${{ github.run_id }}
           restore-keys: |
-            shader-cache-${{ inputs.device }}-
+            shader-cache-metal922-${{ inputs.device }}-
 
       - name: Build unsigned IPA (game files kept separate)
         id: build
@@ -893,6 +897,13 @@ jobs:
 
           echo "Disk space after build:"
           df -h "$RUNNER_TEMP"
+
+      - name: Save shader cache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: shader-cache
+          key: shader-cache-metal922-${{ inputs.device }}-${{ github.run_id }}
 
       - name: Upload IPA
         if: success()
