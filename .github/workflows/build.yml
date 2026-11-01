@@ -22,9 +22,10 @@ permissions:
 
 jobs:
   build:
-    # nxnative needs the Xcode 27.1 / iOS 27 SDK (CMMotionManager.deviceMotionBody,
-    # and the Metal toolchain the shaders were tested with). macos-latest still
-    # resolves to an older image, so pin the macOS 27 image explicitly.
+    # nxnative needs the Xcode 27.2 / iOS 27 SDK (CMMotionManager.deviceMotionBody,
+    # and the Metal toolchain the shaders were tested with: Metal 32023.922).
+    # macos-latest still resolves to an older image, so pin the macOS 27 image
+    # explicitly.
     runs-on: xcode-27
     timeout-minutes: 360
 
@@ -43,18 +44,19 @@ jobs:
           repository: seedds/nxnative
           ref: main
 
-      - name: Select Xcode 27.1 and verify toolchain
+      - name: Select Xcode 27.2 and verify toolchain
         shell: bash
         run: |
           set -euo pipefail
 
-          # On the macos-27 image Xcode 27.1 may be named either
-          # Xcode_27.1.app or Xcode_27.1_Release_Candidate.app
-          # (actions/runner-images issue #15000). Pick whichever exists.
+          # nxnative's dmsh_chain.lock requires Metal 32023.922, which ships
+          # with Xcode 27.2 (Xcode 27.1 has 32023.921 and is rejected).
+          # The app may be named in several ways depending on the image.
           XCODE_APP=""
           for candidate in \
-            /Applications/Xcode_27.1.app \
-            /Applications/Xcode_27.1_Release_Candidate.app; do
+            /Applications/Xcode_27.2.app \
+            /Applications/Xcode_27.2_Release_Candidate.app \
+            /Applications/Xcode-27.2.app; do
             if [[ -d "$candidate" ]]; then
               XCODE_APP="$candidate"
               break
@@ -62,7 +64,7 @@ jobs:
           done
 
           if [[ -z "$XCODE_APP" ]]; then
-            echo "::error::Xcode 27.1 was not found on this runner. Installed Xcodes:"
+            echo "::error::Xcode 27.2 was not found on this runner. Installed Xcodes:"
             ls -d /Applications/Xcode*.app 2>/dev/null || true
             exit 1
           fi
@@ -70,12 +72,19 @@ jobs:
           echo "Selecting $XCODE_APP"
           sudo xcode-select -s "$XCODE_APP/Contents/Developer"
 
+          echo "=== Downloading Metal toolchain ==="
+          xcodebuild -downloadComponent MetalToolchain
+
           echo "=== Xcode ==="
           xcodebuild -version
           echo "=== iOS SDKs ==="
           xcodebuild -showsdks | grep -i ios || true
           echo "=== Metal compiler ==="
-          xcrun metal --version 2>&1 || true
+          METAL_VERSION="$(xcrun metal --version 2>&1 || true)"
+          echo "$METAL_VERSION"
+          if ! grep -q '32023.922' <<< "$METAL_VERSION"; then
+            echo "::warning::Metal compiler is not 32023.922. nxnative may reject this toolchain."
+          fi
 
       - name: Free up disk space
         shell: bash
