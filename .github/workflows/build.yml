@@ -729,15 +729,17 @@ jobs:
       # restore-only here; the matching save step runs after the build with
       # `if: always()`, so progress is kept even when the build step fails
       # or hits its time budget (actions/cache@v4 only saves on success).
-      # "metal922" in the key keeps caches from different Metal compilers apart.
+      # "metal922" keeps caches from different Metal compilers apart; DM_GAME (the
+      # title ID, set by the detect step) keeps each game's cache separate, since
+      # nxnative refuses a cache that belongs to another game.
       - name: Restore shader cache
         id: shader_cache
         uses: actions/cache/restore@v4
         with:
           path: shader-cache
-          key: shader-cache-metal922-${{ inputs.device }}-${{ github.run_id }}
+          key: shader-cache-metal922-${{ env.DM_GAME }}-${{ inputs.device }}-${{ github.run_id }}
           restore-keys: |
-            shader-cache-metal922-${{ inputs.device }}-
+            shader-cache-metal922-${{ env.DM_GAME }}-${{ inputs.device }}-
 
       - name: Build unsigned IPA (game files kept separate)
         id: build
@@ -903,7 +905,7 @@ jobs:
         uses: actions/cache/save@v4
         with:
           path: shader-cache
-          key: shader-cache-metal922-${{ inputs.device }}-${{ github.run_id }}
+          key: shader-cache-metal922-${{ env.DM_GAME }}-${{ inputs.device }}-${{ github.run_id }}
 
       - name: Upload IPA
         if: success()
